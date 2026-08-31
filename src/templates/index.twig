@@ -1,0 +1,74 @@
+{% extends "_layouts/cp" %}
+
+{% set title = "Site Volumes"|t('site-volumes') %}
+
+{% block content %}
+    <p class="light">
+        {{ "Choose which sites each volume is available on. A volume with no sites checked is available everywhere — this only restricts once you check at least one site for it."|t('site-volumes') }}
+    </p>
+
+    {% if installedSiblingPlugins|length %}
+        <div class="pane">
+            <p>
+                {{ "Also installed: {plugins}. These plugins are independent — see the compatibility section in the README for how they interact with Site Volumes."|t('site-volumes', {
+                    plugins: installedSiblingPlugins|join(', ')
+                }) }}
+            </p>
+        </div>
+    {% endif %}
+
+    <form method="post" accept-charset="UTF-8">
+        {{ csrfInput() }}
+        {{ actionInput('site-volumes/settings/save') }}
+        {{ redirectInput('site-volumes') }}
+
+        <table class="data fullwidth">
+            <thead>
+                <tr>
+                    <th scope="col">{{ "Volume"|t('site-volumes') }}</th>
+                    {% for site in sites %}
+                        <th scope="col">{{ site.name }}</th>
+                    {% endfor %}
+                </tr>
+            </thead>
+            <tbody>
+                {% for volume in volumes %}
+                    <tr>
+                        <td><strong>{{ volume.name }}</strong></td>
+                        {% for site in sites %}
+                            <td>
+                                <input type="checkbox"
+                                       name="siteIds[{{ volume.id }}][]"
+                                       value="{{ site.id }}"
+                                       {% if restrictions[volume.id] is defined and site.id in restrictions[volume.id] %}checked{% endif %}>
+                            </td>
+                        {% endfor %}
+                    </tr>
+                {% endfor %}
+                <tr>
+                    <td>
+                        <strong>{{ "Default upload volume"|t('site-volumes') }}</strong>
+                        <div class="light">{{ "Used when an Assets field has no explicit upload location. The first visible source is chosen — this setting moves that volume to the front for the site."|t('site-volumes') }}</div>
+                    </td>
+                    {% for site in sites %}
+                        <td>
+                            <select name="defaultVolumeIds[{{ site.id }}]">
+                                <option value="">{{ "None"|t('site-volumes') }}</option>
+                                {% for volume in volumes %}
+                                    <option value="{{ volume.id }}"
+                                        {% if defaultVolumeIds[site.id] is defined and defaultVolumeIds[site.id] == volume.id %}selected{% endif %}>
+                                        {{ volume.name }}
+                                    </option>
+                                {% endfor %}
+                            </select>
+                        </td>
+                    {% endfor %}
+                </tr>
+            </tbody>
+        </table>
+
+        <div class="buttons">
+            <button type="submit" class="btn submit">{{ "Save"|t('site-volumes') }}</button>
+        </div>
+    </form>
+{% endblock %}

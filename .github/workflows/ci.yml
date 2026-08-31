@@ -1,0 +1,233 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Quality (PHP ${{ matrix.php }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php:
+          - '8.2'
+          - '8.3'
+          - '8.4'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: bcmath, ctype, curl, dom, gd, intl, json, mbstring, openssl, pcre, pdo, sqlite, tokenizer, xml, zip
+          coverage: none
+          tools: composer:v2
+
+      - name: Get Composer cache directory
+        id: composer-cache
+        run: echo "dir=$(composer config cache-files-dir)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Composer dependencies
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.composer-cache.outputs.dir }}
+          key: ${{ runner.os }}-php-${{ matrix.php }}-composer-${{ hashFiles('**/composer.json') }}
+          restore-keys: |
+            ${{ runner.os }}-php-${{ matrix.php }}-composer-
+
+      - name: Validate composer.json
+        run: composer validate --strict --no-check-publish
+
+      - name: Install dependencies
+        run: composer update --prefer-dist --no-progress --no-interaction
+
+      - name: Easy Coding Standard
+        run: composer check-cs
+
+      - name: PHPStan
+        run: composer phpstan
+
+      - name: Rector (dry-run)
+        run: composer rector
+
+      - name: Unit tests
+        run: composer test:unit
+
+  integration:
+    name: Integration (PHP ${{ matrix.php }})
+    needs: quality
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # One PHP version is enough here to keep runtime down; `quality`
+        # already covers the full 8.2-8.4 matrix. Bump this alongside
+        # kernpfad/craft-test-images' tags when a new Craft/Commerce
+        # combination becomes the one to test against.
+        #
+        # Pinned by digest (Craft 5.10.14 / Commerce 5.7.2 / PHP 8.3.33 as
+        # of this pin) rather than just the channel tag, which alone is a
+        # moving target — see kernpfad/craft-test-images' README, "Tags —
+        # three forms, one artifact". Renovate's built-in github-actions
+        # manager (see renovate.json) proposes a PR updating the digest
+        # whenever craft-test-images publishes a new build under this
+        # channel tag; it never changes on its own.
+        include:
+          - php: '8.3'
+            image: ghcr.io/kernpfad/craft-test-base:craft5-commerce5-php8.3@sha256:14fb714e6287a34291f0958d05aae4f320dcc9ab9772ea545050c118cb3569a5
+    container:
+      image: ${{ matrix.image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Mark workspace as a safe git directory
+        # actions/checkout's own safe.directory config is scoped to a
+        # temporary $HOME it restores afterwards, so it doesn't carry over
+        # to later steps in this container job. Composer's path-repository
+        # resolver still probes for VCS info even for a `path` repository,
+        # which otherwise logs (non-fatal, but noisy) "detected dubious
+        # ownership" once it hits git.
+        run: git config --global --add safe.directory "${GITHUB_WORKSPACE}"
+
+      - name: Get Composer cache directory
+        id: composer-cache
+        run: echo "dir=$(composer config cache-files-dir)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Composer dependencies
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.composer-cache.outputs.dir }}
+          key: ${{ runner.os }}-php-${{ matrix.php }}-integration-composer-${{ hashFiles('**/composer.json') }}
+          restore-keys: |
+            ${{ runner.os }}-php-${{ matrix.php }}-integration-composer-
+
+      - name: Install plugin dependencies
+        run: composer install --prefer-dist --no-progress --no-interaction
+
+      - name: Start the baked-in MariaDB
+        # The container job model execs steps into the already-running
+        # container rather than running its ENTRYPOINT, so we start the
+        # image's baked-in, already-migrated MariaDB explicitly here.
+        run: |
+          service mariadb start
+          for i in $(seq 1 60); do mysqladmin ping -h127.0.0.1 --silent && break; sleep 1; done
+          mysqladmin ping -h127.0.0.1 --silent
+
+      - name: Link this plugin into the test Craft install
+        working-directory: /craft
+        run: |
+          composer config repositories.site-volumes path "${GITHUB_WORKSPACE}"
+          composer require kernpfad/craft-site-volumes:@dev --no-interaction --no-progress
+          php craft plugin/install site-volumes
+          php craft migrate/all --interactive=0
+
+      - name: Provision a second site for multi-site tests
+        # The shared craft-test-base image ships a single-site install (zero
+        # plugin-specific fixtures) — SourceFilteringTest needs at least two
+        # sites configured to exercise per-site volume restrictions, and
+        # deliberately refuses to create one itself (see
+        # SourceFilteringTest::setUp, which treats a second site as a
+        # persistent project-config/edition change it shouldn't make from
+        # inside a test — the same philosophy as craft-asset-vault's VaultTest
+        # refusing to create its own volume). That's this plugin's own
+        # fixture need, so it's provisioned here rather than baked into the
+        # shared image. Multi-site also requires an edition above Solo, which
+        # a fresh unlicensed install starts on — setEdition() is Craft's
+        # normal path for unlocking that in local dev/CI without a real
+        # license (see the doc comment atop SourceFilteringTest.php).
+        working-directory: /craft
+        run: |
+          php -r '
+            define("CRAFT_BASE_PATH", getcwd());
+            define("CRAFT_VENDOR_PATH", CRAFT_BASE_PATH . "/vendor");
+            require CRAFT_VENDOR_PATH . "/autoload.php";
+            require CRAFT_VENDOR_PATH . "/craftcms/cms/bootstrap/console.php";
+
+            $sites = Craft::$app->getSites();
+            if (count($sites->getAllSites()) >= 2) {
+                echo "A second site already exists\n";
+                exit(0);
+            }
+
+            if (Craft::$app->getEdition() !== \craft\enums\CmsEdition::Pro) {
+                if (!Craft::$app->setEdition(\craft\enums\CmsEdition::Pro)) {
+                    fwrite(STDERR, "Failed to set edition to Pro\n");
+                    exit(1);
+                }
+            }
+
+            $primarySite = $sites->getPrimarySite();
+
+            $site = new \craft\models\Site([
+                "groupId" => $primarySite->groupId,
+                "name" => "Site Volumes Test Second Site",
+                "handle" => "siteVolumesTestSecondSite",
+                "language" => "en-US",
+                "hasUrls" => true,
+                "baseUrl" => "@web/second/",
+            ]);
+            if (!$sites->saveSite($site)) {
+                fwrite(STDERR, "Failed to save site: " . implode(", ", $site->getErrorSummary(true)) . "\n");
+                exit(1);
+            }
+
+            // Project config writes are normally flushed to persistent
+            // storage at the end of a full request/console-command
+            // lifecycle. This script only bootstraps Craft::$app without
+            // running one (no Craft::$app->run()), so without an explicit
+            // flush here the site definition stays queued in memory and is
+            // gone by the next process — see the same reasoning in
+            // craft-asset-vault''s equivalent fixture step.
+            Craft::$app->getProjectConfig()->saveModifiedConfigData();
+
+            echo "Created siteVolumesTestSecondSite\n";
+          '
+
+      - name: Confirm SourceFilteringTest is part of the discovered suite
+        # A misconfigured fixture would make every test in this suite skip
+        # itself (see SourceFilteringTest::setUp) and the job would still go
+        # green — this step (list-tests, no execution) and the no-skips check
+        # after the run both exist so that can't happen silently.
+        run: vendor/bin/phpunit --testsuite integration --list-tests | tee /tmp/integration-tests-list.txt | grep -q 'SourceFilteringTest::'
+
+      - name: Integration tests
+        env:
+          CRAFT_TEST_SITE_PATH: /craft
+        # This container job's default shell is `sh` (dash), not bash — the
+        # `bash -eo pipefail` GitHub Actions normally defaults `run:` steps
+        # to does NOT apply here. `... | tee file` would let a real PHPUnit
+        # failure go unnoticed: tee (the last command in the pipe) always
+        # exits 0, so the step reports green regardless of composer's exit
+        # code. Redirect to the file directly and capture composer's own
+        # exit code instead, so a real test failure fails this step.
+        run: |
+          composer test:integration > /tmp/integration-output.txt 2>&1 || status=$?
+          cat /tmp/integration-output.txt
+          exit "${status:-0}"
+
+      - name: Confirm the suite actually ran (no skips)
+        run: |
+          if grep -qiE 'skipped|incomplete' /tmp/integration-output.txt; then
+            echo "::error::PHPUnit reported skipped/incomplete tests — the fixture or the Craft install is misconfigured. This must not be reported as a passing integration run." >&2
+            exit 1
+          fi
+          echo "Confirmed: the integration suite ran with zero skips."

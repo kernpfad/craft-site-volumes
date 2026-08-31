@@ -1,0 +1,18 @@
+# Release Notes for Site Volumes
+
+## 1.0.0 - 2026-08-31
+
+- Initial release.
+- Restrict which asset volumes are available per site in a multi-site Craft install, via a control panel settings page (Volume × Site matrix).
+- Volumes with no sites checked remain available everywhere — opt-in per volume, never silently hides an existing volume.
+- Restriction is enforced via Craft's own source-registration event, so it applies both to the main Assets index and to Assets fields' source lists.
+- The source filter reads every volume's restrictions in a single query instead of one query per volume. This hook runs on every Assets index load and every Assets field render, so on an install with many volumes the previous per-volume lookup meant dozens of queries each time.
+- Fixed: the source filter matched against `Sites::getCurrentSite()`, which Craft only sets for front-end and GraphQL requests — on a control panel request it falls back to the primary site regardless of the site menu. A volume restricted to a non-primary site was therefore hidden on *every* site in the control panel, including the one it was restricted to, making the plugin's core feature a no-op. It now resolves the site through `Cp::requestedSite()`, Craft's own answer for "which site is this control panel request about". Covered by a regression test that pins the current site and the requested site to different sites.
+- Added (SV-03): saving a configuration that would leave any site with zero available volumes is now rejected, naming the affected site(s). Previously nothing stopped an admin from checking themselves into a state where an entire site's Assets index and every Assets field came up empty with no way to select or upload anything.
+- Docs (SV-02): README section clarifying that volume/site restrictions don't affect filesystem paths, canonical URLs, or content propagation — those aren't per-site concepts for volumes in Craft.
+- Added (SV-04): optional default upload volume per site. Configured in the settings matrix; the default volume's source is moved to the front of the filtered list so Assets fields without an explicit upload location pick it first.
+- Added (SV-05): README compatibility section for Volume Copy and Asset Vault; control panel notice when either sibling plugin is installed.
+- Added (SV-06): integration tests documenting that source filtering follows `getCurrentSite()` on front-end/GraphQL paths and that element queries are not filtered by volume restrictions; README Limitations expanded accordingly.
+- Added (SV-07): when Craft adds a new site, it automatically inherits the primary site's restricted-volume access and default upload volume (when valid).
+- Added (SV-08): `RestrictionService::EVENT_RESOLVE_VOLUME_FOR_SITE` and `EVENT_RESOLVE_DEFAULT_VOLUME_FOR_SITE` for extending volume and default resolution.
+- Fixed: saving the settings matrix always 404'd. The form's `actionInput()` posted the short URL-rule alias `site-volumes/save` (registered only so a literal `/admin/site-volumes/save` GET/POST resolves) instead of the actual controller route `site-volumes/settings/save`. Craft treats any request carrying an `action` body/query param as an action request and dispatches straight from that string, bypassing the custom CP URL rule entirely — so the alias never resolved to a real controller/action pair and the save button did nothing but 404. Every setting on this page — restrictions, SV-04 default volumes, all of it — was unsavable through the Control Panel. Found while capturing documentation screenshots: the matrix rendered fine, but clicking Save never worked once actually tried against a live, logged-in session.
